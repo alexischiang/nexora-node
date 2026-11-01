@@ -763,12 +763,29 @@ func (s *Service) ensureRunning() bool {
 	return false
 }
 
+// startWithUsers records users and starts the idle kernel with them. A node
+// that came up with no users never started its kernel, and ensureRunning only
+// looks at lastUsers, so users arriving later must be recorded before the
+// start; otherwise every sync.users / delta / REST update is dropped and the
+// kernel stays down until the process restarts. Without a config yet, the
+// users are only recorded and applyChanges starts the kernel once it arrives.
+func (s *Service) startWithUsers(users []model.UserSpec) {
+	prevUsers, prevHash := s.prepareUserState(users)
+	if len(users) == 0 || s.lastConfig == nil {
+		return
+	}
+	if !s.startKernel(s.lastConfig, users) {
+		s.restoreUserState(prevUsers, prevHash)
+	}
+}
+
 // ─── User update entry points ───────────────────────────────────────────────
 
 // applyUserUpdate replaces the full user set and hot-swaps the kernel.
 // Called from WS sync.users and REST polling.
 func (s *Service) applyUserUpdate(ctx context.Context, users []model.UserSpec, newHash string) {
-	if !s.ensureRunning() {
+	if !s.kernel.IsRunning() {
+		s.startWithUsers(users)
 		return
 	}
 
@@ -800,7 +817,8 @@ func (s *Service) applyUserDelta(ctx context.Context, action string, deltaUsers 
 		}
 		merged := mergeUsers(s.lastUsers, deltaUsers)
 
-		if !s.ensureRunning() {
+		if !s.kernel.IsRunning() {
+			s.startWithUsers(merged)
 			return
 		}
 

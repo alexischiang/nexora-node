@@ -198,6 +198,76 @@ func TestApplyUserDeltaAddPreparesLimiterBeforeKernelUpdate(t *testing.T) {
 	}
 }
 
+// A node that started with no users has a config but no running kernel; the
+// first users pushed to it must start the kernel instead of being dropped.
+func TestApplyUserUpdateStartsIdleKernelWithFirstUsers(t *testing.T) {
+	k := &fakeKernel{}
+	s := newTestService(k)
+	s.lastConfig = &model.NodeSpec{Protocol: "vless"}
+
+	users := []model.UserSpec{{ID: 1, UUID: "uuid-1"}}
+	s.applyUserUpdate(context.Background(), users, computeUserHash(users))
+
+	if !k.running || k.startCalls != 1 {
+		t.Fatalf("running = %v, Start calls = %d; want kernel started once", k.running, k.startCalls)
+	}
+	if k.updateCalls != 0 {
+		t.Fatalf("UpdateUsers call count = %d, want 0 (users go in with Start)", k.updateCalls)
+	}
+	if len(s.lastUsers) != 1 || s.lastUserHash != computeUserHash(users) {
+		t.Fatalf("lastUsers = %#v, hash %q; want the pushed users recorded", s.lastUsers, s.lastUserHash)
+	}
+}
+
+func TestApplyUserDeltaAddStartsIdleKernel(t *testing.T) {
+	k := &fakeKernel{}
+	s := newTestService(k)
+	s.lastConfig = &model.NodeSpec{Protocol: "vless"}
+
+	s.applyUserDelta(context.Background(), "add", []model.UserSpec{{ID: 1, UUID: "uuid-1"}})
+
+	if !k.running || k.startCalls != 1 || k.addCalls != 0 {
+		t.Fatalf("running = %v, Start = %d, AddUsers = %d; want kernel started with the delta", k.running, k.startCalls, k.addCalls)
+	}
+	if len(s.lastUsers) != 1 || s.lastUsers[0].UUID != "uuid-1" {
+		t.Fatalf("lastUsers = %#v, want the added user", s.lastUsers)
+	}
+}
+
+func TestApplyUserUpdateWithoutConfigRecordsUsersForLaterStart(t *testing.T) {
+	k := &fakeKernel{}
+	s := newTestService(k)
+
+	users := []model.UserSpec{{ID: 1, UUID: "uuid-1"}}
+	s.applyUserUpdate(context.Background(), users, computeUserHash(users))
+	if k.startCalls != 0 || len(s.lastUsers) != 1 {
+		t.Fatalf("Start calls = %d, lastUsers = %#v; want users recorded without a start", k.startCalls, s.lastUsers)
+	}
+
+	s.lastConfig = &model.NodeSpec{Protocol: "vless"}
+	s.applyChanges(context.Background(), true, false)
+	if !k.running || k.startCalls != 1 {
+		t.Fatalf("running = %v, Start calls = %d; want the config to start the kernel", k.running, k.startCalls)
+	}
+}
+
+func TestApplyUserUpdateRollsBackWhenIdleStartFails(t *testing.T) {
+	k := &fakeKernel{startErr: errors.New("bad config")}
+	s := newTestService(k)
+	s.lastConfig = &model.NodeSpec{Protocol: "vless"}
+	emptyHash := s.lastUserHash
+
+	users := []model.UserSpec{{ID: 1, UUID: "uuid-1"}}
+	s.applyUserUpdate(context.Background(), users, computeUserHash(users))
+
+	if k.running || k.startCalls != 1 {
+		t.Fatalf("running = %v, Start calls = %d; want one failed start", k.running, k.startCalls)
+	}
+	if len(s.lastUsers) != 0 || s.lastUserHash != emptyHash {
+		t.Fatalf("lastUsers = %#v, hash %q; want state restored so the next push retries", s.lastUsers, s.lastUserHash)
+	}
+}
+
 
 func TestValidateNodeRuntimeRejectsUnsupportedDNSProvider(t *testing.T) {
 	cfg := &config.Config{Kernel: config.KernelConfig{Type: "singbox"}}
