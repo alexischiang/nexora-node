@@ -1,8 +1,10 @@
 package xray
 
 import (
+	"context"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/cedar2025/xboard-node/internal/model"
 	"github.com/xtls/xray-core/common/buf"
@@ -12,6 +14,7 @@ import (
 func newTestDispatcher() *LimitDispatcher {
 	return &LimitDispatcher{
 		limitedIPs: make(map[string]map[string]int),
+		userConns:  make(map[string]map[*userConn]struct{}),
 	}
 }
 
@@ -231,5 +234,48 @@ func TestLimitDispatcher_CloseTrackingWriterReleasesConn(t *testing.T) {
 	}
 	if ld.checkDeviceLimit(email, "2.2.2.2", true) {
 		t.Fatal("device slot should be released after writer close")
+	}
+}
+
+func TestLimitDispatcher_CloseUsersEndsOnlyThatUsersConnections(t *testing.T) {
+	ld := newTestDispatcher()
+	removed, kept := userEmail(1), userEmail(2)
+
+	removedCtx, removedConn := ld.watchConn(context.Background(), removed)
+	removedWriter := &closeTrackingWriter{Writer: buf.Discard, onClose: func() {}}
+	removedConn.link.Store(&transport.Link{Reader: nopReader{}, Writer: removedWriter})
+	keptCtx, _ := ld.watchConn(context.Background(), kept)
+
+	if got := ld.CloseUsers([]string{removed}); got != 1 {
+		t.Fatalf("expected 1 closed connection, got %d", got)
+	}
+	select {
+	case <-removedCtx.Done():
+	default:
+		t.Fatal("the removed user's connection context should be cancelled")
+	}
+	if !removedWriter.closed.Load() {
+		t.Fatal("the removed user's link should be interrupted")
+	}
+	if keptCtx.Err() != nil {
+		t.Fatal("another user's connection must stay open")
+	}
+
+	// The entry goes away once its context ends.
+	deadline := time.Now().Add(time.Second)
+	for {
+		ld.connsMu.Lock()
+		_, left := ld.userConns[removed]
+		ld.connsMu.Unlock()
+		if !left {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("closed connection should be unregistered")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if got := ld.CloseUsers([]string{removed}); got != 0 {
+		t.Fatalf("expected nothing left to close, got %d", got)
 	}
 }

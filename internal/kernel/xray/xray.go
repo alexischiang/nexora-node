@@ -90,7 +90,7 @@ func (x *Xray) Capabilities() kernel.Capabilities {
 		BuiltInTrafficStats:  true,
 		AliveIPTracking:      true,
 		ForceCloseConnection: false,
-		ForceCloseUser:       false,
+		ForceCloseUser:       true,
 	}
 }
 
@@ -250,9 +250,34 @@ func (x *Xray) CloseConnection(_ context.Context, _ string) error {
 	return nil
 }
 
-func (x *Xray) CloseUserConnections(_ context.Context, _ string) error {
-	// No-op: handled by RemoveUsers at the xray core level.
+func (x *Xray) CloseUserConnections(_ context.Context, uuid string) error {
+	x.mu.Lock()
+	ld := x.limitDispatcher
+	var users []model.UserSpec
+	for _, u := range x.users {
+		if u.UUID == uuid {
+			users = append(users, u)
+		}
+	}
+	x.mu.Unlock()
+	closeUserConns(ld, users)
 	return nil
+}
+
+// closeUserConns ends the live connections of users that were removed or
+// disabled. Removing a user from xray only refuses new connections; without
+// this, a user who ran out of traffic keeps every open connection.
+func closeUserConns(ld *LimitDispatcher, users []model.UserSpec) {
+	if ld == nil || len(users) == 0 {
+		return
+	}
+	emails := make([]string, 0, len(users))
+	for _, u := range users {
+		emails = append(emails, userEmail(u.ID))
+	}
+	if closed := ld.CloseUsers(emails); closed > 0 {
+		nlog.Core().Info("xray: closed connections of removed users", "users", len(users), "connections", closed)
+	}
 }
 
 // SetSpeedLimitFunc wires xray's patched bandwidth feature to the shared
@@ -360,14 +385,16 @@ func (x *Xray) AddUsers(users []model.UserSpec) (int, error) {
 	return added, nil
 }
 
-// RemoveUsers removes users from the running kernel via xray's UserManager API.
-// Truly hitless for supported protocols — remaining connections unaffected.
+// RemoveUsers removes users from the running kernel via xray's UserManager API
+// and closes their open connections. Truly hitless for supported protocols —
+// remaining users' connections unaffected.
 func (x *Xray) RemoveUsers(users []model.UserSpec) (int, error) {
 	x.mu.Lock()
 	if x.instance == nil {
 		x.mu.Unlock()
 		return 0, fmt.Errorf("not running")
 	}
+	ld := x.limitDispatcher
 	removeSet := make(map[int]struct{}, len(users))
 	for _, u := range users {
 		removeSet[u.ID] = struct{}{}
@@ -388,6 +415,8 @@ func (x *Xray) RemoveUsers(users []model.UserSpec) (int, error) {
 
 	if len(kept) == 0 {
 		x.mu.Unlock()
+		// Stop drains connections; close the removed users' ones first.
+		closeUserConns(ld, users)
 		x.Stop()
 		return removed, nil
 	}
@@ -400,6 +429,8 @@ func (x *Xray) RemoveUsers(users []model.UserSpec) (int, error) {
 		if err := x.Start(nc, kept, t); err != nil {
 			return 0, err
 		}
+		// The old instance keeps its connections while it drains.
+		closeUserConns(ld, users)
 		return removed, nil
 	}
 	x.mu.Unlock()
@@ -414,6 +445,7 @@ func (x *Xray) RemoveUsers(users []model.UserSpec) (int, error) {
 		}
 		actualRemoved++
 	}
+	closeUserConns(ld, users)
 
 	x.mu.Lock()
 	x.users = kept
@@ -436,6 +468,7 @@ func (x *Xray) UpdateUsers(users []model.UserSpec) (added, removed int, err erro
 	}
 	toAdd, toRemove := kernel.UserDiff(x.users, users)
 	added, removed = len(toAdd), len(toRemove)
+	ld := x.limitDispatcher
 
 	if added == 0 && removed == 0 {
 		// Only limits changed — update dispatcher without restart.
@@ -456,6 +489,8 @@ func (x *Xray) UpdateUsers(users []model.UserSpec) (added, removed int, err erro
 		if err = x.Start(nc, users, t); err != nil {
 			return 0, 0, err
 		}
+		// The old instance keeps its connections while it drains.
+		closeUserConns(ld, toRemove)
 		return
 	}
 
@@ -472,6 +507,7 @@ func (x *Xray) UpdateUsers(users []model.UserSpec) (added, removed int, err erro
 			nlog.Core().Debug("xray: RemoveUser skipped in UpdateUsers", "user", u.ID, "error", err)
 		}
 	}
+	closeUserConns(ld, toRemove)
 	for _, u := range toAdd {
 		mu, err := toMemoryUser(proto, nc, u)
 		if err != nil {
