@@ -52,6 +52,7 @@ func limitDispatcherFactory(ctx context.Context, config interface{}) (interface{
 		inner:      orig,
 		innerDisp:  inner,
 		limitedIPs: make(map[string]map[string]int),
+		userConns:  make(map[string]map[*userConn]struct{}),
 	}
 	globalLimitDispatcher.Store(ld)
 	nlog.Core().Debug("xray: limit dispatcher installed")
@@ -81,6 +82,26 @@ type LimitDispatcher struct {
 	unlimitedIPs sync.Map // email → *ipCounter
 
 	connCount atomic.Int64 // total active connections tracked by dispatcher
+
+	// userConns: email → live connections, so the connections of a removed
+	// user can be closed. Removing a user from xray only refuses new ones.
+	connsMu   sync.Mutex
+	userConns map[string]map[*userConn]struct{}
+}
+
+// userConn is one live dispatched connection of a user. Cancelling its
+// context ends the outbound side; interrupting the link ends the inbound side.
+type userConn struct {
+	cancel context.CancelFunc
+	link   atomic.Pointer[transport.Link]
+}
+
+func (c *userConn) close() {
+	c.cancel()
+	if link := c.link.Load(); link != nil {
+		common.Interrupt(link.Reader)
+		common.Interrupt(link.Writer)
+	}
 }
 
 // ipCounter tracks IPs for unlimited users without any lock.
@@ -108,8 +129,16 @@ func (d *LimitDispatcher) Dispatch(ctx context.Context, dest net.Destination) (*
 		return nil, err
 	}
 
+	var conn *userConn
+	if email != "" {
+		ctx, conn = d.watchConn(ctx, email)
+	}
+
 	link, err := d.innerDisp.Dispatch(ctx, dest)
 	if err != nil {
+		if conn != nil {
+			conn.cancel()
+		}
 		if email != "" && isTCP {
 			d.delConn(email, sourceIP)
 		}
@@ -118,6 +147,7 @@ func (d *LimitDispatcher) Dispatch(ctx context.Context, dest net.Destination) (*
 
 	if email != "" {
 		d.trackLink(link, email, sourceIP, isTCP)
+		conn.link.Store(link)
 	}
 	return link, nil
 }
@@ -129,9 +159,59 @@ func (d *LimitDispatcher) DispatchLink(ctx context.Context, dest net.Destination
 	}
 
 	if email != "" {
+		var conn *userConn
+		ctx, conn = d.watchConn(ctx, email)
 		d.trackLink(link, email, sourceIP, isTCP)
+		conn.link.Store(link)
 	}
 	return d.innerDisp.DispatchLink(ctx, dest, link)
+}
+
+// watchConn registers a connection of email under a cancellable context. The
+// entry is dropped when the context ends: when the inbound finishes the
+// connection, or when CloseUsers cancels it.
+func (d *LimitDispatcher) watchConn(ctx context.Context, email string) (context.Context, *userConn) {
+	ctx, cancel := context.WithCancel(ctx)
+	conn := &userConn{cancel: cancel}
+
+	d.connsMu.Lock()
+	conns := d.userConns[email]
+	if conns == nil {
+		conns = make(map[*userConn]struct{})
+		d.userConns[email] = conns
+	}
+	conns[conn] = struct{}{}
+	d.connsMu.Unlock()
+
+	context.AfterFunc(ctx, func() {
+		d.connsMu.Lock()
+		defer d.connsMu.Unlock()
+		if conns := d.userConns[email]; conns != nil {
+			delete(conns, conn)
+			if len(conns) == 0 {
+				delete(d.userConns, email)
+			}
+		}
+	})
+	return ctx, conn
+}
+
+// CloseUsers ends every live connection of the given users and returns how
+// many were closed.
+func (d *LimitDispatcher) CloseUsers(emails []string) int {
+	var conns []*userConn
+	d.connsMu.Lock()
+	for _, email := range emails {
+		for conn := range d.userConns[email] {
+			conns = append(conns, conn)
+		}
+	}
+	d.connsMu.Unlock()
+
+	for _, conn := range conns {
+		conn.close()
+	}
+	return len(conns)
 }
 
 // identifyAndCheck extracts user identity from the session context, enforces
